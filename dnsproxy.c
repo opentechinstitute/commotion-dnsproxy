@@ -1,5 +1,5 @@
 /**
- *       @file  daemon.c
+ *       @file  dnsproxy.c
  *      @brief  Functionality of commotion-dnsproxy
  *
  *     @author  Dan Staples (dismantl), danstaples@opentechinstitute.org
@@ -24,10 +24,13 @@
 
 #define _GNU_SOURCE
 #include <netinet/ip.h>
+#include <net/if.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <signal.h>
@@ -37,6 +40,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <ldns/ldns.h>
 #include <getopt.h>
 #include "debug.h"
@@ -174,7 +178,119 @@ error:
   return ret;
 }
 
-static void _co_loop_handle_signals(int sig) {
+static char *
+get_ip_address(const char *interface)
+{
+  int fd = 0;
+  char *ret = NULL;
+  CHECK(strlen(interface) < IFNAMSIZ, "Interface name too long");
+  CHECK((fd  = socket(AF_INET, SOCK_DGRAM, 0)), "socket() error");
+  struct ifreq ifr;
+  ifr.ifr_addr.sa_family = AF_INET;
+  strncpy(ifr.ifr_name, interface, IFNAMSIZ-1);
+  CHECK(ioctl(fd,SIOCGIFADDR,&ifr) == 0, "ioctl() error");
+  ret = inet_ntoa(((struct sockaddr_in*)&ifr.ifr_addr)->sin_addr);
+error:
+  if (fd)
+    close(fd);
+  return ret;
+}
+
+/** 
+ * Fork a child and execute a shell command.
+ * The parent process waits for the child to return,
+ * and returns the child's exit() value.
+ * @return Return code of the command
+ * Modified from Nodogsplash
+ * @author Copyright (C) 2004 Philippe April <papril777@yahoo.com>
+ * @author Copyright (C) 2006 Benoit Grégoire <bock@step.polymtl.ca> *
+ * @author Copyright (C) 2008 Paul Kube <nodogsplash@kokoro.ucsd.edu>
+ */
+static int
+execute(const char *cmd_line)
+{
+  int status;
+  pid_t pid, rc;
+  const char *new_argv[4];
+  new_argv[0] = "/bin/sh";
+  new_argv[1] = "-c";
+  new_argv[2] = cmd_line;
+  new_argv[3] = NULL;
+  
+  pid = fork();
+  CHECK(pid >= 0, "fork() error");
+  
+  if (pid == 0) {    /* for the child process:         */
+    DEBUG("Executing command: %s", cmd_line);
+    execvp("/bin/sh", (char *const *)new_argv);
+    // if execution continues from here, an error occured
+    ERROR("execvp() error");
+    exit(EXIT_FAILURE);
+  } else {        /* for the parent:      */
+    do {
+      rc = waitpid(pid, &status, 0);
+      if(rc == -1) {
+	if(errno == ECHILD) {
+	  DEBUG("waitpid(): No child exists now. Assuming normal exit for PID %d", (int)pid);
+	  return 0;
+	} else {
+	  SENTINEL("Error waiting for child (waitpid() returned -1)");
+	}
+      }
+      if(WIFEXITED(status)) {
+	DEBUG("Process PID %d exited normally, status %d", (int)rc, WEXITSTATUS(status));
+	return (WEXITSTATUS(status));
+      }
+      CHECK(!WIFSIGNALED(status),
+	    "Process PID %d exited due to signal %d", (int)rc, WTERMSIG(status));
+    } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+  }
+error:
+  return -1;
+}
+
+/**
+ * Modified from Nodogsplash
+ * @author Copyright (C) 2004 Philippe April <papril777@yahoo.com>
+ * @author Copyright (C) 2007 Paul Kube <nodogsplash@kokoro.ucsd.edu>
+ */
+static int
+setup_iptables(const char *interface, int server_port, int listen_port, bool init)
+{
+  int rc = -1;
+  char *cmd = NULL, 
+       *ipaddr = get_ip_address(interface);
+  
+  CHECK(ipaddr, "Could not get IP address of given interface %s", interface);
+  CHECK(asprintf(&cmd, "iptables -%c PREROUTING -t nat -i %s -p udp -d %s --dport %d -j DNAT --to-destination %s:%d -m comment --comment \"Commotion DNS proxy\"",
+		 (init) ? 'I' : 'D',
+		 interface,
+		 ipaddr,
+		 server_port,
+		 ipaddr,
+		 listen_port) > 0,
+	"asprintf() error");
+  
+  for (int i = 0; i < 5; i++) {
+    rc = execute(cmd);
+    /* iptables error code 4 indicates a resource problem that might
+     * be temporary. So we retry to insert the rule a few times. (Mitar) */
+    if (rc == 4)
+      sleep(1);
+    else
+      break;
+  }
+  CHECK(rc == 0, "Nonzero exit status %d from command: %s", rc, cmd);
+  
+error:
+  if (cmd)
+    free(cmd);
+  return rc;
+}
+
+static void
+signal_handler(int sig)
+{
   switch(sig) {
     case SIGHUP:
       DEBUG("Received SIGHUP signal.");
@@ -190,26 +306,33 @@ static void _co_loop_handle_signals(int sig) {
   }
 }
 
-static void _setup_signals(void) {
+static int
+setup_signals(void)
+{
+  int ret = -1;
   struct sigaction new_sigaction;
   sigset_t new_sigset;
   
   //Set signal mask - signals we want to block
-  sigemptyset(&new_sigset);
-  sigaddset(&new_sigset, SIGTSTP); //ignore TTY stop signals
-  sigaddset(&new_sigset, SIGTTOU); //ignore TTY background writes
-  sigaddset(&new_sigset, SIGTTIN); //ignore TTY background reads
-  sigprocmask(SIG_BLOCK, &new_sigset, NULL); //block the above signals
+  CHECK(sigemptyset(&new_sigset) == 0, "sigemptyset() error");
+  CHECK(sigaddset(&new_sigset, SIGTSTP) == 0, "sigaddset() error"); //ignore TTY stop signals
+  CHECK(sigaddset(&new_sigset, SIGTTOU) == 0, "sigaddset() error"); //ignore TTY background writes
+  CHECK(sigaddset(&new_sigset, SIGTTIN) == 0, "sigaddset() error"); //ignore TTY background reads
+  CHECK(sigprocmask(SIG_BLOCK, &new_sigset, NULL) == 0, "sigprocmask() error"); //block the above signals
 
   //Set up signal handler
-  new_sigaction.sa_handler = _co_loop_handle_signals;
-  sigemptyset(&new_sigaction.sa_mask);
+  new_sigaction.sa_handler = signal_handler;
+  CHECK(sigemptyset(&new_sigaction.sa_mask) == 0, "sigemptyset() error");
   new_sigaction.sa_flags = 0;
 
   //Signals to handle:
-  sigaction(SIGHUP, &new_sigaction, NULL); //catch hangup signal
-  sigaction(SIGTERM, &new_sigaction, NULL); //catch term signal
-  sigaction(SIGINT, &new_sigaction, NULL); //catch interrupt signal
+  CHECK(sigaction(SIGHUP, &new_sigaction, NULL) == 0, "sigaction() error"); //catch hangup signal
+  CHECK(sigaction(SIGTERM, &new_sigaction, NULL) == 0, "sigaction() error"); //catch term signal
+  CHECK(sigaction(SIGINT, &new_sigaction, NULL) == 0, "sigaction() error"); //catch interrupt signal
+  
+  ret = 0;
+error:
+  return ret;
 }
 
 static void
@@ -257,18 +380,21 @@ daemon_start(char *pidfile)
   write(pid_filehandle, str, strlen(str));
 }
 
-static void print_usage() {
+static void
+print_usage(void)
+{
   printf(
     "Commotion DNS Proxy\n"
     "https://commotionwireless.net\n\n"
     "Usage: dnsproxy [options]\n"
     "\n"
     "Options:\n"
-    " -b, --bind <port>         Specify port to listen on.\n"
-    " -s, --server-port <port>  Specify port of DNS server to connect to.\n"
-    " -n, --nodaemonize         Do not fork into the background.\n"
-    " -p, --pid <file>      Specify pid file.\n"
-    " -h, --help                Print this usage message.\n"
+    " -b, --bind <port>            Specify port to listen on.\n"
+    " -s, --server-port <port>     Specify port of DNS server to connect to.\n"
+    " -n, --nodaemonize            Do not fork into the background.\n"
+    " -p, --pid <file>             Specify pid file.\n"
+    " -i, --interface <interface>  Specify interface to proxy requests on.\n"
+    " -h, --help                   Print this usage message.\n"
   );
 }
 
@@ -281,15 +407,17 @@ main(int argc, char **argv)
       daemonize = 1,
       port = LISTENING_PORT,
       server_port = SERVER_PORT;
-  char *pidfile = NULL;
+  char *pidfile = NULL,
+       *interface = NULL;
 
-  static const char *opt_string = "hnb:s:p:";
+  static const char *opt_string = "hnb:s:p:i:";
   static struct option long_opts[] = {
     {"help", no_argument, NULL, 'h'},
     {"nodaemon", no_argument, NULL, 'n'},
     {"bind", required_argument, NULL, 'b'},
     {"pid", required_argument, NULL, 'p'},
-    {"server-port", required_argument, NULL, 's'}
+    {"server-port", required_argument, NULL, 's'},
+    {"interface", required_argument, NULL, 'i'}
   };
   
   /* Parse command line arguments */
@@ -311,6 +439,9 @@ main(int argc, char **argv)
       case 'p':
 	pidfile = optarg;
 	break;
+      case 'i':
+	interface = optarg;
+	break;
       case 'h':
       default:
 	print_usage();
@@ -324,6 +455,12 @@ main(int argc, char **argv)
     CHECK(pidfile, "Must specify PID file");
     daemon_start(pidfile);
   }
+  
+  CHECK(interface, "Must specify interface");
+  
+  CHECK(setup_signals() == 0, "Failed to setup signal handlers");
+  
+  CHECK(setup_iptables(interface, server_port, port, true) == 0, "Failed to set up iptables rules");
   
   struct sockaddr_in laddr = {
     .sin_family = AF_INET,
@@ -343,8 +480,6 @@ main(int argc, char **argv)
   struct epoll_event events[LOOP_MAXEVENT];
   memset(&events, 0, LOOP_MAXEVENT * sizeof(struct epoll_event));
   
-  _setup_signals();
-  
   // add listening socket to epoll
   struct epoll_event event;
   memset(&event, 0, sizeof(struct epoll_event));
@@ -361,7 +496,7 @@ main(int argc, char **argv)
   while(!loop_exit) {
     int n = epoll_wait(poll_fd, events, LOOP_MAXEVENT, -1);
     if (loop_exit) break;
-    CHECK(n != -1, "epoll_wait error");
+    CHECK(n != -1, "epoll_wait() error");
     for(int i = 0; i < n; i++) {
       struct dns_requester *requester = (struct dns_requester*)events[i].data.ptr;
       int fd = requester->fd;
@@ -385,6 +520,7 @@ main(int argc, char **argv)
 
   ret = 0;
 error:
+  setup_iptables(interface, server_port, port, false);
   close(lfd);
   close(poll_fd);
   return ret;
